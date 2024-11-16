@@ -530,7 +530,7 @@ fn parse_dat(
     dat.set_column_names(&new_columns)?;
 
     // join sumstats align with merge_alleles
-    let join_dat = dat
+    let mut join_dat = dat
         .clone()
         .lazy()
         .join(
@@ -545,51 +545,89 @@ fn parse_dat(
     if let Some(x) = drops.get_mut("MERGE") {
         *x += clean_snps - merged_count;
     }
+    println!("{:?}", join_dat);
 
     // filter INFO
-    let bad_info_df = join_dat
-        .clone()
-        .lazy()
-        // ((info > 2.0) | (info < 0)) & info.notnull
-        .filter((col("INFO").gt_eq(2.0).or(col("INFO").lt_eq(0.0))).and(col("INFO").is_not_null()))
-        .collect()?;
-    let bad_info_count = bad_info_df.height();
-    if bad_info_count > 0 {
-        warn!(
-            "WARNING: {} SNPs had INFO outside of [0,2]. The INFO column may be mislabeled.",
-            bad_info_count
-        );
-    }
-    let reject_info_count = join_dat
-        .clone()
-        .lazy()
-        .filter(col("INFO").lt_eq(args.info_min))
-        .collect()?
-        .height();
-    if let Some(x) = drops.get_mut("INFO") {
-        *x += reject_info_count;
+    if new_columns.contains(&"INFO".to_string()) {
+        let bad_info_df = join_dat
+            .clone()
+            .lazy()
+            // ((info > 2.0) | (info < 0)) & info.notnull
+            .filter(
+                (col("INFO").gt_eq(2.0).or(col("INFO").lt_eq(0.0))).and(col("INFO").is_not_null()),
+            )
+            .collect()?;
+        let bad_info_count = bad_info_df.height();
+        if bad_info_count > 0 {
+            warn!(
+                "WARNING: {} SNPs had INFO outside of [0,2]. The INFO column may be mislabeled.",
+                bad_info_count
+            );
+        }
+        let reject_info_count = join_dat
+            .clone()
+            .lazy()
+            .filter(col("INFO").lt_eq(args.info_min))
+            .collect()?
+            .height();
+        if let Some(x) = drops.get_mut("INFO") {
+            *x += reject_info_count;
+        }
     }
 
     // Filter FRQ
-    let bad_frq_df = join_dat
-        .clone()
-        .lazy()
-        .filter(col("FRQ").lt_eq(0.0).or(col("FRQ").gt_eq(1.0)))
-        .collect()?;
-    let bad_frq_count = bad_frq_df.height();
-    if bad_frq_count > 0 {
-        warn!(
-            "WARNING: {} SNPs had FRQ outside of [0,1]. The FRQ column may be mislabeled.",
-            bad_frq_count
-        );
+    if new_columns.contains(&"FRQ".to_string()) {
+        let bad_frq_df = join_dat
+            .clone()
+            .lazy()
+            .filter(col("FRQ").lt_eq(0.0).or(col("FRQ").gt_eq(1.0)))
+            .collect()?;
+        let bad_frq_count = bad_frq_df.height();
+        if bad_frq_count > 0 {
+            warn!(
+                "WARNING: {} SNPs had FRQ outside of [0,1]. The FRQ column may be mislabeled.",
+                bad_frq_count
+            );
+        }
+        let low_maf = args.maf_min;
+        let high_maf = 1_f64 - args.maf_min;
+        let reject_maf_count = join_dat
+            .clone()
+            .lazy()
+            .filter(col("FRQ").lt_eq(low_maf).or(col("FRQ").gt_eq(high_maf)))
+            .collect()?
+            .height();
+        if let Some(x) = drops.get_mut("FRQ") {
+            *x += reject_maf_count;
+        }
     }
-    let low_maf = args.maf_min;
-    let high_maf = 1_f64 - args.maf_min;
-    let reject_maf_count = join_dat
+
+    // drop info and frq if not needed
+    if new_columns.contains(&"INFO".to_string()) {
+        join_dat.drop_in_place("INFO")?;
+    }
+    if new_columns.contains(&"FRQ".to_string()) && !args.keep_maf {
+        join_dat.drop_in_place("FRQ")?;
+    }
+
+    // filter P
+    let bad_p_df = join_dat
         .clone()
         .lazy()
-        .filter(col("FRQ").lt_eq(low_maf).or(col("FRQ").gt_eq(high_maf)))
+        .filter(col("P").lt_eq(0.0).or(col("P").gt_eq(1.0)))
         .collect()?;
+    let bad_p_count = bad_p_df.height();
+    if bad_p_count > 0 {
+        warn!(
+            "WARNING: {} SNPs had P outside of [0,1]. The P column may be mislabeled.",
+            bad_p_count
+        );
+        if let Some(x) = drops.get_mut("P") {
+            *x += bad_p_count;
+        }
+    }
+
+    // if not no_alleles
 
     println!("{:?}", join_dat);
     Ok(dat)
