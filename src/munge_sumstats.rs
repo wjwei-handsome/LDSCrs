@@ -183,7 +183,6 @@ fn main() -> Result<()> {
             0 => bail!("Could not find a signed summary statistic column."),
             1 => {
                 let cname = sign_cnames[0];
-                println!("sing_name:{:?}", cname);
                 let signed_sumstst_null =
                     Some(*NULL_VALUES.get(cname_translation[&cname].as_str()).unwrap() as f64);
                 cname_translation.insert(cname, "SIGNED_SUMSTAT".to_string());
@@ -291,7 +290,7 @@ fn main() -> Result<()> {
     for c in &signed_sumstats_cols {
         sign_schema.with_column(c.as_str().into(), DataType::Float64);
     }
-    info!("Signed sumstats schema: {:?}", sign_schema);
+    // info!("Signed sumstats schema: {:?}", sign_schema);
 
     let parse_opts = CsvParseOptions::default()
         .with_separator(b'\t')
@@ -325,7 +324,6 @@ fn main() -> Result<()> {
     //     .finish()?;
     // println!("{:?}", lazy_sumspd.collect()?);
 
-    println!("{:?}", sumspd);
     let dat = parse_dat(sumspd, cname_translation, merge_alleles_df.unwrap(), &args)?;
     println!("{:?}", dat);
     Ok(())
@@ -553,7 +551,7 @@ fn parse_dat(
         "Removed {} SNPs not in --merge-alleles.",
         drops.get("MERGE").unwrap()
     );
-    println!("{:?}", dat);
+    // println!("{:?}", dat);
 
     // filter INFO
     if new_columns.contains(&"INFO".to_string()) {
@@ -677,7 +675,25 @@ fn parse_dat(
     );
 
     let remain_count = dat.height();
+    if remain_count == 0 {
+        bail!("After applying filters, no SNPs remain.");
+    }
     info!("{} SNPs remained", remain_count);
     info!("Done.");
+
+    // remove dup SNPs
+    // unique SNP
+    let unique_dat = dat
+        .clone()
+        .lazy()
+        .unique_stable(Some(vec!["SNP".into()]), UniqueKeepStrategy::Any)
+        .collect()?;
+    let dup_count = dat.height() - unique_dat.height();
+    dat = unique_dat;
+    info!(
+        "Removed {} SNPs with duplicated rs numbers ({} SNPs remain).",
+        dup_count,
+        dat.height()
+    );
     Ok(dat)
 }
