@@ -12,7 +12,7 @@ flate2 = "1.0.34"
 log = "0.4.22"
 xz2 = "0.1.7"
 phf = { version = "0.11", default-features = false, features = ["macros"] }
-polars = { version = "0.44.2", features = ["concat_str", "csv", "lazy", "polars-io", "strings"] }
+polars = { version = "0.44.2", features = ["concat_str", "csv", "is_in", "lazy", "polars-io", "strings"] }
 
 
 [[bin]]

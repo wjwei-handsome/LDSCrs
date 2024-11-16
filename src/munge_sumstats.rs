@@ -326,8 +326,8 @@ fn main() -> Result<()> {
     // println!("{:?}", lazy_sumspd.collect()?);
 
     println!("{:?}", sumspd);
-    parse_dat(sumspd, cname_translation, merge_alleles_df.unwrap(), &args)?;
-
+    let dat = parse_dat(sumspd, cname_translation, merge_alleles_df.unwrap(), &args)?;
+    println!("{:?}", dat);
     Ok(())
 }
 
@@ -494,7 +494,7 @@ fn parse_dat(
 ) -> Result<DataFrame> {
     let origin_tot_snps = dat.height();
     // let mut dat_list = Vec::new();
-
+    info!("Read {} SNPs from --sumstats file.", origin_tot_snps);
     let mut drops = HashMap::from([
         ("NA", 0),
         ("P", 0),
@@ -521,6 +521,10 @@ fn parse_dat(
     if let Some(x) = drops.get_mut("NA") {
         *x += origin_tot_snps - clean_snps;
     }
+    info!(
+        "Removed {} SNPs with missing values.",
+        drops.get("NA").unwrap()
+    );
 
     // rename columns
     let new_columns = colnames
@@ -530,7 +534,7 @@ fn parse_dat(
     dat.set_column_names(&new_columns)?;
 
     // join sumstats align with merge_alleles
-    let mut join_dat = dat
+    let mut dat = dat
         .clone()
         .lazy()
         .join(
@@ -541,15 +545,19 @@ fn parse_dat(
         )
         .collect()?;
     // calculate merged count
-    let merged_count = join_dat.height();
+    let merged_count = dat.height();
     if let Some(x) = drops.get_mut("MERGE") {
         *x += clean_snps - merged_count;
     }
-    println!("{:?}", join_dat);
+    info!(
+        "Removed {} SNPs not in --merge-alleles.",
+        drops.get("MERGE").unwrap()
+    );
+    println!("{:?}", dat);
 
     // filter INFO
     if new_columns.contains(&"INFO".to_string()) {
-        let bad_info_df = join_dat
+        let bad_info_df = dat
             .clone()
             .lazy()
             // ((info > 2.0) | (info < 0)) & info.notnull
@@ -564,20 +572,25 @@ fn parse_dat(
                 bad_info_count
             );
         }
-        let reject_info_count = join_dat
+        dat = dat
             .clone()
             .lazy()
-            .filter(col("INFO").lt_eq(args.info_min))
-            .collect()?
-            .height();
+            .filter(col("INFO").gt_eq(args.info_min))
+            .collect()?;
+
         if let Some(x) = drops.get_mut("INFO") {
-            *x += reject_info_count;
+            *x += merged_count - dat.height();
         }
     }
+    info!(
+        "Removed {} SNPs with INFO <= {}.",
+        drops.get("INFO").unwrap(),
+        args.info_min
+    );
 
     // Filter FRQ
     if new_columns.contains(&"FRQ".to_string()) {
-        let bad_frq_df = join_dat
+        let bad_frq_df = dat
             .clone()
             .lazy()
             .filter(col("FRQ").lt_eq(0.0).or(col("FRQ").gt_eq(1.0)))
@@ -591,32 +604,38 @@ fn parse_dat(
         }
         let low_maf = args.maf_min;
         let high_maf = 1_f64 - args.maf_min;
-        let reject_maf_count = join_dat
+        let pass_maf_dat = dat
             .clone()
             .lazy()
-            .filter(col("FRQ").lt_eq(low_maf).or(col("FRQ").gt_eq(high_maf)))
-            .collect()?
-            .height();
+            .filter(col("FRQ").gt_eq(low_maf).or(col("FRQ").lt_eq(high_maf)))
+            .collect()?;
         if let Some(x) = drops.get_mut("FRQ") {
-            *x += reject_maf_count;
+            *x += dat.height() - pass_maf_dat.height();
         }
+        dat = pass_maf_dat;
     }
+    info!(
+        "Removed {} SNPs with MAF <= {}.",
+        drops.get("FRQ").unwrap(),
+        args.maf_min,
+    );
 
     // drop info and frq if not needed
     if new_columns.contains(&"INFO".to_string()) {
-        join_dat.drop_in_place("INFO")?;
+        dat.drop_in_place("INFO")?;
     }
     if new_columns.contains(&"FRQ".to_string()) && !args.keep_maf {
-        join_dat.drop_in_place("FRQ")?;
+        dat.drop_in_place("FRQ")?;
     }
 
     // filter P
-    let bad_p_df = join_dat
+    let pass_p_df = dat
         .clone()
         .lazy()
-        .filter(col("P").lt_eq(0.0).or(col("P").gt_eq(1.0)))
+        .filter(col("P").gt_eq(0.0).or(col("P").lt_eq(1.0)))
         .collect()?;
-    let bad_p_count = bad_p_df.height();
+    let pass_p_count = pass_p_df.height();
+    let bad_p_count = dat.height() - pass_p_count;
     if bad_p_count > 0 {
         warn!(
             "WARNING: {} SNPs had P outside of [0,1]. The P column may be mislabeled.",
@@ -626,9 +645,39 @@ fn parse_dat(
             *x += bad_p_count;
         }
     }
+    dat = pass_p_df;
+    info!(
+        "Removed {} SNPs with out-of-bounds p-values.",
+        drops.get("P").unwrap()
+    );
 
-    // if not no_alleles
+    if !args.no_alleles {
+        // A1+A2 in VALID_SNPS
+        let valid_snps = Series::new(
+            "valid_snps".into(),
+            ["AC", "GT", "AG", "CA", "GA", "TG", "TC", "CT"],
+        );
+        let mut pass_alleles_df = dat
+            .clone()
+            .lazy()
+            .with_column(concat_str([col("A1"), col("A2")], "", false).alias("tmp_MA"))
+            .filter(col("tmp_MA").is_in(lit(valid_snps)))
+            .collect()?;
+        // drop tmp_MA
+        pass_alleles_df.drop_in_place("tmp_MA")?;
+        let pass_alleles_count = pass_alleles_df.height();
+        if let Some(x) = drops.get_mut("A") {
+            *x += dat.height() - pass_alleles_count;
+        }
+        dat = pass_alleles_df;
+    }
+    info!(
+        "Removed {} variants that were not SNPs or were strand-ambiguous.",
+        drops.get("A").unwrap()
+    );
 
-    println!("{:?}", join_dat);
+    let remain_count = dat.height();
+    info!("{} SNPs remained", remain_count);
+    info!("Done.");
     Ok(dat)
 }
