@@ -1,5 +1,7 @@
 use anyhow::{bail, Result};
 use clap::{ArgAction, Parser};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use ldscrs::const_value::{DEFAULT_CNAMES, DESCRIBE_CNAME, NULL_VALUES};
 use ldscrs::utils::get_input_reader;
 use log::{info, warn};
@@ -7,10 +9,12 @@ use polars::prelude::*;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::HashMap;
 use std::env::set_var;
+use std::fs::File;
 use std::io::BufRead;
 use std::path::PathBuf;
 
 const GROUP: &str = "Column names. NB: case insensitive.";
+const TOLERANCE: f64 = 0.1;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -306,20 +310,18 @@ fn main() -> Result<()> {
                 .map(|x| x.as_str().into())
                 .collect(),
         ))
+        .with_ignore_errors(true)
         .with_schema_overwrite(Some(sign_schema.into()))
         .with_chunk_size(args.chunksize)
         .try_into_reader_with_file_path(Some(sumstats_path.into()))?
         .finish()?;
+    println!("{:?}", sumspd);
 
     let dat = parse_dat(sumspd, cname_translation, merge_alleles_df.unwrap(), &args)?;
-    println!("{:?}", dat);
-    let dat = process_n(dat, &args)?;
-    println!("{:?}", dat);
-    // trans p to z
-    // np.sqrt(chi2.isf(P, 1))
-    // let p_col =
-    let p_col = dat.column("P")?.f64()?;
+    let mut dat = process_n(dat, &args)?;
 
+    // trans p to z
+    let p_col = dat.column("P")?.f64()?;
     let chi2 = ChiSquared::new(1.0)?;
     // calculate
     let z_values: Vec<f64> = p_col
@@ -332,7 +334,105 @@ fn main() -> Result<()> {
             }
         })
         .collect();
-    println!("{:?}", z_values);
+    let z_series = Series::new("Z".into(), z_values);
+    dat.with_column(z_series)?;
+    // drop p
+    dat.drop_in_place("P")?;
+
+    if !args.a1_inc {
+        let median_sign = dat.column("SIGNED_SUMSTAT")?.f64()?.median().unwrap();
+        let diff = (median_sign - signed_sumstst_null.unwrap()).abs();
+        if diff > TOLERANCE {
+            warn!(
+                "WARNING: median value of {} is {} (should be close to {}). This column may be mislabeled.",
+                sign_cname, median_sign, signed_sumstst_null.unwrap()
+            );
+        } else {
+            info!(
+                "Median value of {} was {}, which seems sensible",
+                sign_cname, median_sign
+            );
+        }
+
+        // dat.Z *= (-1) ** (dat.SIGNED_SUMSTAT < signed_sumstat_null)
+        let signed_sumstat = dat.column("SIGNED_SUMSTAT")?.f64()?;
+        let z = dat.column("Z")?.f64()?;
+        let z_values: Vec<f64> = signed_sumstat
+            .into_iter()
+            .zip(z)
+            .map(|(signed, z)| match (signed, z) {
+                (Some(signed), Some(z)) if signed < signed_sumstst_null.unwrap() => -z,
+                (Some(_), Some(z)) => z,
+                _ => f64::NAN,
+            })
+            .collect();
+        dat.with_column(Series::new("Z".into(), z_values))?;
+        dat.drop_in_place("SIGNED_SUMSTAT")?;
+    }
+
+    if args.merge_alleles.is_some() {
+        // compare A1+A2 to MA
+        let valid_alleles = Series::new(
+            "valid_alleles".into(),
+            [
+                "GTAC", "ACAC", "ACGT", "GTTG", "CTAG", "CTCT", "ACCA", "CTTC", "AGTC", "GTGT",
+                "GTCA", "AGGA", "GACT", "GAGA", "GAAG", "AGCT", "GATC", "CAAC", "CAGT", "TGCA",
+                "CACA", "TGAC", "AGAG", "CATG", "TCCT", "TCGA", "TGTG", "TGGT", "CTGA", "TCAG",
+                "TCTC", "ACTG",
+            ],
+        );
+        dat = dat
+            .clone()
+            .lazy()
+            .with_column(concat_str([col("A1"), col("A2"), col("MA")], "", false).alias("tmp_MA"))
+            .collect()?;
+        let origin_len = dat.height();
+        dat = dat
+            .clone()
+            .lazy()
+            .filter(col("tmp_MA").is_in(lit(valid_alleles)))
+            .collect()?;
+        let clean_len = dat.height();
+        info!(
+            "Removed {} SNPs whose alleles did not match --merge-alleles ({} SNPs remain).",
+            origin_len - clean_len,
+            clean_len
+        );
+        dat.drop_in_place("tmp_MA")?;
+    }
+
+    let out_fname = format!("{}.sumstats.gz", args.out);
+
+    let mut print_colnames = dat
+        .get_column_names()
+        .iter()
+        .map(|x| x.as_str())
+        // in ['SNP', 'N', 'Z', 'A1', 'A2']
+        .filter(|c| ["SNP", "N", "Z", "A1", "A2", "FRQ"].contains(c))
+        .collect::<Vec<_>>();
+    if !args.keep_maf {
+        print_colnames.retain(|x| *x != "FRQ");
+    }
+
+    let final_len = dat.height();
+    let nomiss_n_mask = dat.column("N")?.i64()?.is_not_null();
+    let nomiss_len = dat.column("N")?.i64()?.filter(&nomiss_n_mask)?.len();
+    info!(
+        "Writing summary statistics for {} SNPs ({} with nonmissing beta) to {}.",
+        final_len,
+        final_len - nomiss_len,
+        out_fname
+    );
+
+    // write to file
+    let mut outfile = File::create(out_fname)?;
+    let mut gzip_encoder = GzEncoder::new(&mut outfile, Compression::default()).finish()?;
+    CsvWriter::new(&mut gzip_encoder)
+        .include_header(true)
+        .with_separator(b'\t')
+        .with_float_precision(Some(3))
+        .finish(&mut dat.select(print_colnames)?)?;
+    println!("{:?}", dat);
 
     Ok(())
 }
@@ -467,7 +567,7 @@ fn parse_flag_colnames(args: &Args) -> Result<(HashMap<String, String>, Option<f
 fn get_merge_allels_df(ma_path: &str) -> Result<DataFrame> {
     // merge_alleles = pd.read_csv(args.merge_alleles, compression=compression, header=0,
     //     delim_whitespace=True, na_values='.')
-    let parse_opts = CsvParseOptions::default().with_separator(b' ');
+    let parse_opts = CsvParseOptions::default().with_separator(b'\t');
     let mapd = CsvReadOptions::default()
         .with_parse_options(parse_opts)
         .with_has_header(true)
@@ -613,7 +713,7 @@ fn parse_dat(
         let pass_maf_dat = dat
             .clone()
             .lazy()
-            .filter(col("FRQ").gt_eq(low_maf).or(col("FRQ").lt_eq(high_maf)))
+            .filter(col("FRQ").gt_eq(low_maf).and(col("FRQ").lt_eq(high_maf)))
             .collect()?;
         if let Some(x) = drops.get_mut("FRQ") {
             *x += dat.height() - pass_maf_dat.height();
@@ -731,7 +831,7 @@ fn process_n(dat: DataFrame, args: &Args) -> Result<DataFrame> {
         let n_min = if let Some(n_min) = args.n_min {
             n_min
         } else {
-            let n = dat.column("N")?.f64()?;
+            let n = dat.column("N")?.i64()?;
             n.quantile(0.9, QuantileMethod::Linear)?.unwrap() / 1.5
         };
         let old_count = dat.height();
