@@ -4,6 +4,7 @@ use ldscrs::const_value::{DEFAULT_CNAMES, DESCRIBE_CNAME, NULL_VALUES};
 use ldscrs::utils::get_input_reader;
 use log::{info, warn};
 use polars::prelude::*;
+use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::HashMap;
 use std::env::set_var;
 use std::io::BufRead;
@@ -310,22 +311,29 @@ fn main() -> Result<()> {
         .try_into_reader_with_file_path(Some(sumstats_path.into()))?
         .finish()?;
 
-    // let lazy_sumspd = LazyCsvReader::new(args.sumstats)
-    //     .with_separator(b'\t')
-    //     .with_null_values(Some(NullValues::AllColumns(vec![".".into(), "NA".into()])))
-    //     .with_has_header(true)
-    //     // .with_columns(Some(
-    //     //     cname_translation
-    //     //         .keys()
-    //     //         .map(|x| x.as_str().into())
-    //     //         .collect(),
-    //     // ))
-    //     .with_dtype_overwrite(Some(sign_schema.into()))
-    //     .finish()?;
-    // println!("{:?}", lazy_sumspd.collect()?);
-
     let dat = parse_dat(sumspd, cname_translation, merge_alleles_df.unwrap(), &args)?;
     println!("{:?}", dat);
+    let dat = process_n(dat, &args)?;
+    println!("{:?}", dat);
+    // trans p to z
+    // np.sqrt(chi2.isf(P, 1))
+    // let p_col =
+    let p_col = dat.column("P")?.f64()?;
+
+    let chi2 = ChiSquared::new(1.0)?;
+    // calculate
+    let z_values: Vec<f64> = p_col
+        .into_iter()
+        .map(|p| {
+            if let Some(p_val) = p {
+                chi2.inverse_cdf(1.0 - p_val).sqrt()
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    println!("{:?}", z_values);
+
     Ok(())
 }
 
@@ -695,5 +703,83 @@ fn parse_dat(
         dup_count,
         dat.height()
     );
+    Ok(dat)
+}
+
+// Determine sample size from --N* flags or N* columns. Filter out low N SNPs.s
+fn process_n(dat: DataFrame, args: &Args) -> Result<DataFrame> {
+    let colnames = dat
+        .get_column_names()
+        .iter()
+        .map(|x| x.as_str())
+        .collect::<Vec<_>>();
+    let mut dat = dat.clone();
+    if colnames.contains(&"N_CAS") && colnames.contains(&"N_CON") {
+        let n_cas = dat.column("N_CAS")?.i64()?;
+        let n_con = dat.column("N_CON")?.i64()?;
+        let n = n_cas + n_con;
+        let p = (&n_cas.cast(&DataType::Float64)? / &n.cast(&DataType::Float64)?)?;
+        let max_n = n.max().unwrap();
+        let p_max_n = p.filter(&n.equal(max_n))?.mean().unwrap();
+        let new_n_series = Series::new("N".into(), n_cas.cast(&DataType::Float64)? / p_max_n);
+        dat.with_column(new_n_series)?;
+        dat.drop_in_place("N_CAS")?;
+        dat.drop_in_place("N_CON")?;
+    }
+
+    if colnames.contains(&"N") {
+        let n_min = if let Some(n_min) = args.n_min {
+            n_min
+        } else {
+            let n = dat.column("N")?.f64()?;
+            n.quantile(0.9, QuantileMethod::Linear)?.unwrap() / 1.5
+        };
+        let old_count = dat.height();
+        dat = dat.lazy().filter(col("N").gt_eq(lit(n_min))).collect()?;
+        let new_count = dat.height();
+        info!(
+            "Removed {} SNPs with N < {} ({} SNPs remain).",
+            old_count - new_count,
+            n_min,
+            new_count
+        );
+    } else if colnames.contains(&"NSTUDY") && !colnames.contains(&"N") {
+        let nstudy_min = if let Some(nstudy_min) = args.nstudy_min {
+            nstudy_min
+        } else {
+            let nstudy = dat.column("NSTUDY")?.f64()?;
+            nstudy.max().unwrap()
+        };
+        let old_count = dat.height();
+        dat = dat
+            .lazy()
+            .filter(col("NSTUDY").gt_eq(lit(nstudy_min)))
+            .collect()?;
+        dat.drop_in_place("NSTUDY")?;
+        let new_count = dat.height();
+        info!(
+            "Removed {} SNPs with NSTUDY < {} ({} SNPs remain).",
+            old_count - new_count,
+            nstudy_min,
+            new_count
+        );
+    }
+
+    if !colnames.contains(&"N") {
+        if let Some(n) = args.n {
+            dat = dat.lazy().with_column(lit(n).alias("N")).collect()?;
+            info!("Using N = {}", n);
+        } else if let (Some(n_cas), Some(n_con)) = (args.n_cas, args.n_con) {
+            let n = n_cas + n_con;
+            dat = dat.lazy().with_column(lit(n).alias("N")).collect()?;
+            if !args.daner {
+                info!("Using N_cas = {}; N_con = {}", n_cas, n_con);
+            }
+        } else {
+            bail!(
+                "Cannot determine N. This message indicates a bug.\nN should have been checked earlier in the program."
+            );
+        }
+    }
     Ok(dat)
 }
