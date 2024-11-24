@@ -297,11 +297,14 @@ fn main() -> Result<()> {
     }
     // info!("Signed sumstats schema: {:?}", sign_schema);
 
+    // Temporary for reading N, due to some N looks like 7e05 but it's a i64
+    sign_schema.with_column("N".into(), DataType::Float64);
+
     let parse_opts = CsvParseOptions::default()
         .with_separator(b'\t')
         .with_null_values(Some(NullValues::AllColumns(vec![".".into(), "NA".into()])));
     let sumstats_path = args.sumstats.clone();
-    let sumspd = CsvReadOptions::default()
+    let mut sumspd = CsvReadOptions::default()
         .with_parse_options(parse_opts)
         .with_has_header(true)
         .with_columns(Some(
@@ -310,11 +313,17 @@ fn main() -> Result<()> {
                 .map(|x| x.as_str().into())
                 .collect(),
         ))
-        .with_ignore_errors(true)
+        // .with_ignore_errors(true)
         .with_schema_overwrite(Some(sign_schema.into()))
         .with_chunk_size(args.chunksize)
         .try_into_reader_with_file_path(Some(sumstats_path.into()))?
         .finish()?;
+    // trans N col to i64
+    sumspd = sumspd
+        .clone()
+        .lazy()
+        .with_column(col("N").cast(DataType::Int64).alias("N"))
+        .collect()?;
     println!("{:?}", sumspd);
 
     let dat = parse_dat(sumspd, cname_translation, merge_alleles_df.unwrap(), &args)?;
@@ -650,7 +659,7 @@ fn parse_dat(
             JoinArgs::default(),
         )
         .collect()?;
-    // calculate merged count
+
     let merged_count = dat.height();
     if let Some(x) = drops.get_mut("MERGE") {
         *x += clean_snps - merged_count;
@@ -659,7 +668,6 @@ fn parse_dat(
         "Removed {} SNPs not in --merge-alleles.",
         drops.get("MERGE").unwrap()
     );
-    // println!("{:?}", dat);
 
     // filter INFO
     if new_columns.contains(&"INFO".to_string()) {
@@ -699,7 +707,7 @@ fn parse_dat(
         let bad_frq_df = dat
             .clone()
             .lazy()
-            .filter(col("FRQ").lt_eq(0.0).or(col("FRQ").gt_eq(1.0)))
+            .filter(col("FRQ").lt(0.0).or(col("FRQ").gt(1.0)))
             .collect()?;
         let bad_frq_count = bad_frq_df.height();
         if bad_frq_count > 0 {
@@ -713,7 +721,7 @@ fn parse_dat(
         let pass_maf_dat = dat
             .clone()
             .lazy()
-            .filter(col("FRQ").gt_eq(low_maf).and(col("FRQ").lt_eq(high_maf)))
+            .filter(col("FRQ").gt(low_maf).and(col("FRQ").lt_eq(high_maf)))
             .collect()?;
         if let Some(x) = drops.get_mut("FRQ") {
             *x += dat.height() - pass_maf_dat.height();
@@ -738,13 +746,13 @@ fn parse_dat(
     let pass_p_df = dat
         .clone()
         .lazy()
-        .filter(col("P").gt_eq(0.0).or(col("P").lt_eq(1.0)))
+        .filter(col("P").gt(0.0).and(col("P").lt_eq(1.0)))
         .collect()?;
     let pass_p_count = pass_p_df.height();
     let bad_p_count = dat.height() - pass_p_count;
     if bad_p_count > 0 {
         warn!(
-            "WARNING: {} SNPs had P outside of [0,1]. The P column may be mislabeled.",
+            "WARNING: {} SNPs had P outside of (0,1]. The P column may be mislabeled.",
             bad_p_count
         );
         if let Some(x) = drops.get_mut("P") {
