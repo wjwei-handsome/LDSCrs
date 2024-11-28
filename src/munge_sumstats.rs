@@ -10,7 +10,8 @@ use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::HashMap;
 use std::env::set_var;
 use std::fs::File;
-use std::io::BufRead;
+use std::io::prelude::*;
+use std::io::{BufRead, BufWriter};
 use std::path::PathBuf;
 
 const GROUP: &str = "Column names. NB: case insensitive.";
@@ -324,9 +325,8 @@ fn main() -> Result<()> {
         .lazy()
         .with_column(col("N").cast(DataType::Int64).alias("N"))
         .collect()?;
-    println!("{:?}", sumspd);
 
-    let dat = parse_dat(sumspd, cname_translation, merge_alleles_df.unwrap(), &args)?;
+    let dat = parse_dat(sumspd, cname_translation, &merge_alleles_df, &args)?;
     let mut dat = process_n(dat, &args)?;
 
     // trans p to z
@@ -378,6 +378,7 @@ fn main() -> Result<()> {
         dat.with_column(Series::new("Z".into(), z_values))?;
         dat.drop_in_place("SIGNED_SUMSTAT")?;
     }
+    println!("{:?}", dat);
 
     if args.merge_alleles.is_some() {
         // compare A1+A2 to MA
@@ -408,6 +409,16 @@ fn main() -> Result<()> {
             clean_len
         );
         dat.drop_in_place("tmp_MA")?;
+        dat = dat
+            .clone()
+            .lazy()
+            .join(
+                merge_alleles_df.clone().unwrap().lazy(),
+                [col("SNP")],
+                [col("SNP")],
+                JoinArgs::new(JoinType::Right).with_coalesce(JoinCoalesce::CoalesceColumns),
+            )
+            .collect()?;
     }
 
     let out_fname = format!("{}.sumstats.gz", args.out);
@@ -428,20 +439,19 @@ fn main() -> Result<()> {
     let nomiss_len = dat.column("N")?.i64()?.filter(&nomiss_n_mask)?.len();
     info!(
         "Writing summary statistics for {} SNPs ({} with nonmissing beta) to {}.",
-        final_len,
-        final_len - nomiss_len,
-        out_fname
+        final_len, nomiss_len, out_fname
     );
 
     // write to file
-    let mut outfile = File::create(out_fname)?;
-    let mut gzip_encoder = GzEncoder::new(&mut outfile, Compression::default()).finish()?;
+    let outfile = File::create(out_fname)?;
+    let mut gzip_encoder = GzEncoder::new(outfile, Compression::default());
     CsvWriter::new(&mut gzip_encoder)
         .include_header(true)
         .with_separator(b'\t')
+        .with_null_value("".to_owned())
         .with_float_precision(Some(3))
         .finish(&mut dat.select(print_colnames)?)?;
-    println!("{:?}", dat);
+    gzip_encoder.finish()?;
 
     Ok(())
 }
@@ -604,7 +614,7 @@ fn get_merge_allels_df(ma_path: &str) -> Result<DataFrame> {
 fn parse_dat(
     dat: DataFrame,
     convert_colname: HashMap<&String, String>,
-    merge_alleles: DataFrame,
+    merge_alleles: &Option<DataFrame>,
     args: &Args,
 ) -> Result<DataFrame> {
     let origin_tot_snps = dat.height();
@@ -648,17 +658,30 @@ fn parse_dat(
         .collect::<Vec<_>>();
     dat.set_column_names(&new_columns)?;
 
-    // join sumstats align with merge_alleles
-    let mut dat = dat
-        .clone()
-        .lazy()
-        .join(
-            merge_alleles.clone().lazy(),
-            [col("SNP")],
-            [col("SNP")],
-            JoinArgs::default(),
-        )
-        .collect()?;
+    // join sumstats align with merge_alleles SNP if merge_alleles is not None
+    // let mut dat = dat
+    //     .clone()
+    //     .lazy()
+    //     .join(
+    //         merge_alleles.clone().lazy(),
+    //         [col("SNP")],
+    //         [col("SNP")],
+    //         JoinArgs::default(),
+    //     )
+    //     .collect()?;
+    let mut dat = match merge_alleles {
+        Some(merge_alleles) => dat
+            .clone()
+            .lazy()
+            .join(
+                merge_alleles.clone().lazy(),
+                [col("SNP")],
+                [col("SNP")],
+                JoinArgs::default(),
+            )
+            .collect()?,
+        None => dat,
+    };
 
     let merged_count = dat.height();
     if let Some(x) = drops.get_mut("MERGE") {
@@ -811,6 +834,7 @@ fn parse_dat(
         dup_count,
         dat.height()
     );
+
     Ok(dat)
 }
 
