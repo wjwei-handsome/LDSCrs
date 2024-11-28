@@ -2,17 +2,17 @@ use anyhow::{bail, Result};
 use clap::{ArgAction, Parser};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use ldscrs::const_value::{DEFAULT_CNAMES, DESCRIBE_CNAME, NULL_VALUES};
-use ldscrs::utils::get_input_reader;
 use log::{info, warn};
 use polars::prelude::*;
+use rayon::prelude::*;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::HashMap;
 use std::env::set_var;
 use std::fs::File;
-use std::io::prelude::*;
-use std::io::{BufRead, BufWriter};
-use std::path::PathBuf;
+use std::io::BufRead;
+
+use ldscrs::const_value::{DEFAULT_CNAMES, DESCRIBE_CNAME, NULL_VALUES};
+use ldscrs::utils::get_input_reader;
 
 const GROUP: &str = "Column names. NB: case insensitive.";
 const TOLERANCE: f64 = 0.1;
@@ -115,8 +115,12 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // TODO: add timer
-    // add loger
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build_global()?;
+
+    let start = std::time::Instant::now();
+    // Initialize logger
     init_logger(&args)?;
 
     // get colnames
@@ -136,15 +140,17 @@ fn main() -> Result<()> {
     info!("Ignore columns: {:?}", ignore_cnames);
 
     // remove LOG_ODDS, BETA, Z, OR from the default list
-    let mod_default_cnames: HashMap<&str, &str> = if args.signed_sumstats.is_some() || args.a1_inc {
-        DEFAULT_CNAMES
-            .into_iter()
-            .filter(|&(_, v)| !NULL_VALUES.contains_key(v))
-            .map(|(k, v)| (*k, *v))
-            .collect()
-    } else {
-        DEFAULT_CNAMES.into_iter().map(|(k, v)| (*k, *v)).collect()
-    };
+    let mod_default_cnames: HashMap<&str, &str> = DEFAULT_CNAMES
+        .into_iter()
+        .filter(|&(_, v)| {
+            if args.signed_sumstats.is_some() || args.a1_inc {
+                !NULL_VALUES.contains_key(v)
+            } else {
+                true
+            }
+        })
+        .map(|(k, v)| (*k, *v))
+        .collect();
     info!("Modified default column names: {:?}", mod_default_cnames);
 
     // get colnames map
@@ -239,10 +245,10 @@ fn main() -> Result<()> {
 
     if args.n.is_none()
         && (args.n_cas.is_none() || args.n_con.is_none())
-        && !cname_translation.values().any(|v| v == "N")
-        && (["N_CAS", "N_CON"]
-            .iter()
-            .any(|x| !cname_translation.values().any(|v| v == *x)))
+        && !(cname_translation.values().any(|v| v == "N")
+            || ["N_CAS", "N_CON"]
+                .iter()
+                .all(|x| cname_translation.values().any(|v| v == *x)))
     {
         bail!("Could not determine N.");
     }
@@ -328,20 +334,14 @@ fn main() -> Result<()> {
 
     let dat = parse_dat(sumspd, cname_translation, &merge_alleles_df, &args)?;
     let mut dat = process_n(dat, &args)?;
-
     // trans p to z
     let p_col = dat.column("P")?.f64()?;
     let chi2 = ChiSquared::new(1.0)?;
     // calculate
     let z_values: Vec<f64> = p_col
-        .into_iter()
-        .map(|p| {
-            if let Some(p_val) = p {
-                chi2.inverse_cdf(1.0 - p_val).sqrt()
-            } else {
-                f64::NAN
-            }
-        })
+        .into_no_null_iter()
+        .par_bridge()
+        .map(|p_val| chi2.inverse_cdf(1.0 - p_val).sqrt())
         .collect();
     let z_series = Series::new("Z".into(), z_values);
     dat.with_column(z_series)?;
@@ -378,7 +378,6 @@ fn main() -> Result<()> {
         dat.with_column(Series::new("Z".into(), z_values))?;
         dat.drop_in_place("SIGNED_SUMSTAT")?;
     }
-    println!("{:?}", dat);
 
     if args.merge_alleles.is_some() {
         // compare A1+A2 to MA
@@ -447,12 +446,15 @@ fn main() -> Result<()> {
     let mut gzip_encoder = GzEncoder::new(outfile, Compression::default());
     CsvWriter::new(&mut gzip_encoder)
         .include_header(true)
+        .n_threads(8)
         .with_separator(b'\t')
         .with_null_value("".to_owned())
         .with_float_precision(Some(3))
         .finish(&mut dat.select(print_colnames)?)?;
     gzip_encoder.finish()?;
 
+    let duration = start.elapsed();
+    info!("Time elapsed in expensive_function() is: {:?}", duration);
     Ok(())
 }
 
@@ -488,14 +490,6 @@ fn init_logger(args: &Args) -> Result<()> {
     set_var("RUST_LOG", "info");
     env_logger::init();
     Ok(())
-}
-
-fn validate_path(path: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(path);
-    if !path.exists() {
-        anyhow::bail!("File not found: {:?}", path);
-    }
-    Ok(path)
 }
 
 fn get_file_colnames(sumstats_path: &str) -> Result<Vec<String>> {
